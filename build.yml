@@ -1,0 +1,109 @@
+name: build-deepslate-ore-sim
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # OreSim by krwawiec / gumark (GPL-3.0), pinned to a fixed commit
+      - uses: actions/checkout@v4
+        with:
+          repository: oHfok/oresim
+          ref: 2b2c1c59467fa23a843dc29831000f335c860037
+          path: upstream
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Patch OreSim to show only deepslate coal and deepslate emerald
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+
+          root = pathlib.Path("upstream")
+          base = root / "src/main/java/dev/gumark/oresim"
+
+          def patch(path, old, new):
+              s = path.read_text()
+              n = s.count(old)
+              if n != 1:
+                  sys.exit("PATCH FAILED in %s: expected 1 match, found %d for: %r" % (path.name, n, old[:70]))
+              path.write_text(s.replace(old, new))
+
+          # 1. brighter coal colour (the default dark grey is hard to see against deepslate)
+          patch(base / "OreType.java",
+                'COAL("Coal", 0xFF4A4A4A)',
+                'COAL("Coal", 0xFFFF7A00)')
+
+          # 2. default seed, used when no seed has been set for the server
+          patch(base / "SeedStore.java",
+                "    private SeedStore() {\n    }",
+                "    private static final long DEFAULT_SEED = 6608149111735331168L;\n\n    private SeedStore() {\n    }")
+          patch(base / "SeedStore.java",
+                "        if (address == null) return null;\n        return ServerSeedMemory.get(address);\n    }\n\n    /** Persists",
+                "        if (address == null) return null;\n        Long remembered = ServerSeedMemory.get(address);\n        return remembered != null ? remembered : DEFAULT_SEED;\n    }\n\n    /** Persists")
+
+          # 3. only report deepslate coal and deepslate emerald
+          sim = base / "OreSimulator.java"
+          patch(sim,
+                "    private final LongOpenHashSet placedThisChunk = new LongOpenHashSet();",
+                "    private final LongOpenHashSet placedThisChunk = new LongOpenHashSet();\n"
+                "    /** Positions where the simulated ore is the deepslate variant. */\n"
+                "    private final LongOpenHashSet deepslateHits = new LongOpenHashSet();")
+          patch(sim,
+                "        placedThisChunk.clear();\n        surfaceHeights.clear();",
+                "        placedThisChunk.clear();\n        deepslateHits.clear();\n        surfaceHeights.clear();")
+          patch(sim,
+                "            if (!ores.isEmpty()) {\n                result.put(ore, ores);\n            }",
+                "            // Only deepslate coal and deepslate emerald are reported. Every other ore is still\n"
+                "            // simulated (it decides which positions later ores can take) but is not shown.\n"
+                "            if (ore.type == OreType.COAL || ore.type == OreType.EMERALD) {\n"
+                "                ores.removeIf(p -> !deepslateHits.contains(p.asLong()));\n"
+                "                if (!ores.isEmpty()) {\n"
+                "                    result.put(ore, ores);\n"
+                "                }\n"
+                "            }")
+          patch(sim,
+                "            placed = shouldPlace(random, pos, ore.discardOnAirChance);\n        } else {",
+                "            placed = shouldPlace(random, pos, ore.discardOnAirChance);\n"
+                "            if (placed && pos.getY() < 0) deepslateHits.add(packed);\n        } else {")
+          patch(sim,
+                "                    placed = shouldPlace(random, pos, ore.discardOnAirChance);\n                    break;",
+                "                    placed = shouldPlace(random, pos, ore.discardOnAirChance);\n"
+                "                    if (placed && isDeepslateOre(target.state())) deepslateHits.add(packed);\n"
+                "                    break;")
+          patch(sim,
+                "    /** Mirrors vanilla's {@code shouldSkipAirCheck}",
+                "    private static boolean isDeepslateOre(BlockState state) {\n"
+                "        Block block = state.getBlock();\n"
+                "        return block == Blocks.DEEPSLATE_COAL_ORE || block == Blocks.DEEPSLATE_EMERALD_ORE;\n"
+                "    }\n\n"
+                "    /** Mirrors vanilla's {@code shouldSkipAirCheck}")
+
+          # 4. jar name
+          patch(root / "gradle.properties",
+                "archives_base_name=oresim-by-krwawiec",
+                "archives_base_name=deepslate-ore-sim")
+
+          print("all patches applied")
+          PY
+
+      - name: Build
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deepslate-ore-sim
+          path: |
+            upstream/build/libs/*.jar
+            !upstream/build/libs/*-sources.jar
